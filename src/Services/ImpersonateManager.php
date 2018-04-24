@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Foundation\Application;
 use Lab404\Impersonate\Events\LeaveImpersonation;
 use Lab404\Impersonate\Events\TakeImpersonation;
+use Illuminate\Contracts\Auth\Authenticatable;
 
 class ImpersonateManager
 {
@@ -28,9 +29,9 @@ class ImpersonateManager
      * @param   int $id
      * @return  Model
      */
-    public function findUserById($id)
+    public function findUserById($id, $model = null)
     {
-        $model = $this->app['config']->get('auth.providers.users.model');
+        $model = $model ?? $this->app['config']->get('auth.providers.users.model');
 
         $user = call_user_func([
             $model,
@@ -65,10 +66,17 @@ class ImpersonateManager
     public function take($from, $to)
     {
         try {
-            session()->put($this->getSessionKey(), $from->getKey());
+            $fromGuard = $this->determineGuard($from);
+            $toGuard   = $this->determineGuard($to);
 
-            $this->app['auth']->quietLogout();
-            $this->app['auth']->quietLogin($to);
+            session()->put($this->getSessionKey(), [
+                'key'   => $from->getKey(),
+                'from'  => $fromGuard,
+                'to'    => $toGuard,
+            ]);
+
+            $this->app['auth']->guard($fromGuard)->quietLogout();
+            $this->app['auth']->guard($toGuard)->quietLogin($to);
 
         } catch (\Exception $e) {
             unset($e);
@@ -86,12 +94,19 @@ class ImpersonateManager
     public function leave()
     {
         try {
-            $impersonated = $this->app['auth']->user();
-            $impersonator = $this->findUserById($this->getImpersonatorId());
+            $imp = $this->getImpersonatorId();
+            $fromGuard = $imp['to'];
+            $toGuard   = $imp['from'];
 
-            $this->app['auth']->quietLogout();
-            $this->app['auth']->quietLogin($impersonator);
-            
+            $provider = config("auth.guards.{$toGuard}.provider");
+            $model = config("auth.providers.{$provider}.model");
+
+            $impersonated = $this->app['auth']->guard($fromGuard)->user();
+            $impersonator = $this->findUserById($imp['key'], $model);
+
+            $this->app['auth']->guard($fromGuard)->quietLogout();
+            $this->app['auth']->guard($toGuard)->quietLogin($impersonator);
+
             $this->clear();
 
         } catch (\Exception $e) {
@@ -146,5 +161,39 @@ class ImpersonateManager
         }
 
         return $uri;
+    }
+
+    /**
+     * @return  string
+     */
+    public function determineGuard(Authenticatable $user)
+    {
+        $class     = get_class($user);
+        $guards    = config('auth.guards');
+        $providers = config('auth.providers');
+
+        $provider = array_reduce(array_keys($providers), function($result, $key) use ($class, $providers) {
+            if($providers[$key]['model'] == $class && $providers[$key]['driver'] == 'eloquent') {
+                $result = $key;
+            }
+            return $result;
+        }, '');
+
+        if(empty($provider)) {
+            throw new \Exception("Error when selecting provider for {$class}");
+        }
+
+        $guard = array_reduce(array_keys($guards), function($result, $key) use ($provider, $guards) {
+            if($guards[$key]['provider'] == $provider && $guards[$key]['driver'] == 'session') {
+                $result = $key;
+            }
+            return $result;
+        }, '');
+
+        if(empty($guard)) {
+            throw new \Exception("Error when selecting guard for {$provider} provider.");
+        }
+
+        return $guard;
     }
 }
